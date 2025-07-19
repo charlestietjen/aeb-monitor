@@ -1,7 +1,7 @@
 // Canadian Tire Stock Checker
 // Uses stocktrack.ca to check stock availability at specified Canadian Tire stores
 
-// No external imports needed - we'll use the built-in Deno.connect for SMTP
+// No external imports needed - using Deno's built-in networking
 
 // Define types for our configuration
 interface StoreStock {
@@ -50,11 +50,76 @@ interface EmailConfig {
   provider: string; // "smtp" or "console"
   host: string;     // SMTP server hostname
   port: number;     // SMTP server port
-  secure: boolean;  // Use TLS
   username?: string; // SMTP username (if authentication is required)
   password?: string; // SMTP password (if authentication is required)
   fromEmail: string; // Sender email address
   fromName?: string; // Sender name (optional)
+}
+
+/**
+ * Simple function to send an email via the system mail command
+ */
+async function sendSmtpEmail(options: {
+  host: string;
+  port: number;
+  username?: string;
+  password?: string;
+  from: string;
+  to: string;
+  subject: string;
+  text: string;
+  html?: string;
+}): Promise<void> {
+  const { from, to, subject, html, text } = options;
+  
+  // Create a temporary file for the email content
+  const tempFile = await Deno.makeTempFile();
+  try {
+    // Write the HTML content to the temp file
+    await Deno.writeTextFile(tempFile, html || text);
+    
+    // Use the mail command with the -a flag to set the From header
+    const mailCommand = new Deno.Command("mail", {
+      args: [
+        "-s", subject,
+        "-a", `From: ${from}`,
+        "-a", "Content-Type: text/html",
+        to
+      ],
+      stdin: "piped",
+      stdout: "piped",
+      stderr: "piped",
+    });
+    
+    // Spawn the process
+    const mailProcess = mailCommand.spawn();
+    
+    // Read the content from the temp file and write to stdin
+    const fileContent = await Deno.readTextFile(tempFile);
+    const encoder = new TextEncoder();
+    const writer = mailProcess.stdin.getWriter();
+    await writer.write(encoder.encode(fileContent));
+    writer.releaseLock();
+    await mailProcess.stdin.close();
+    
+    // Wait for the process to complete
+    const { code, stderr } = await mailProcess.output();
+    
+    if (code !== 0) {
+      const errorOutput = new TextDecoder().decode(stderr);
+      throw new Error(`Mail command failed with code ${code}: ${errorOutput}`);
+    }
+    
+    // Success
+    console.log(`Mail sent to ${to} via system mail command`);
+  } finally {
+    // Clean up the temp file
+    try {
+      await Deno.remove(tempFile);
+    } catch (error) {
+      console.error("Error removing temp file:", error);
+    }
+  }
 }
 
 interface Config {
@@ -191,8 +256,7 @@ async function sendNotification(config: Config, stockInfo: StockResponse): Promi
     
     if (emailConfig.provider === "smtp") {
       // Send email using direct SMTP
-      // We're using the system mail command, so we don't need SMTP credentials
-      const { host, port, fromEmail } = emailConfig;
+      const { host, port, username, password, fromEmail } = emailConfig;
       const fromName = emailConfig.fromName || "Canadian Tire Stock Checker";
       
       // Basic validation
@@ -203,36 +267,24 @@ async function sendNotification(config: Config, stockInfo: StockResponse): Promi
       console.log(`Sending email notification to ${email} via SMTP...`);
       
       try {
-        // Use the system mail command on the DigitalOcean droplet
-        // This is a simple approach that relies on the server's mail configuration
-        // The mail command should be available on most Linux systems
+        // Use our direct SMTP implementation
+        const sender = fromName ? `${fromName} <${fromEmail}>` : fromEmail;
         
-        // Create a temporary file for the email content
-        const tempFileName = `/tmp/stock_alert_${Date.now()}.txt`;
-        const emailContent = `Subject: ${subject}\nFrom: ${fromName} <${fromEmail}>\nTo: ${email}\nContent-Type: text/html\n\n${htmlContent}`;
-        
-        await Deno.writeTextFile(tempFileName, emailContent);
-        
-        // Use the mail command to send the email
-        const mailCommand = new Deno.Command("mail", {
-          args: ["-t", "<", tempFileName],
-          stdout: "piped",
-          stderr: "piped",
+        await sendSmtpEmail({
+          host,
+          port,
+          username,
+          password,
+          from: sender,
+          to: email,
+          subject: subject,
+          text: plainTextContent,
+          html: htmlContent,
         });
-        
-        const { code, stderr } = await mailCommand.output();
-        
-        // Clean up the temporary file
-        await Deno.remove(tempFileName);
-        
-        if (code !== 0) {
-          const errorOutput = new TextDecoder().decode(stderr);
-          throw new Error(`Mail command failed: ${errorOutput}`);
-        }
         
         console.log(`Email notification sent to ${email} successfully`);
       } catch (error) {
-        console.error("Email error:", error);
+        console.error("SMTP error:", error);
         throw new Error(`Failed to send email: ${String(error)}`);
       }
     } else {
